@@ -66,7 +66,10 @@ class LoRAManager:
         lora_paths: Optional[List[LoRARef]] = None,
     ):
         self.base_model: torch.nn.Module = base_model
-        self.base_hf_config: AutoConfig = base_hf_config
+        if hasattr(base_hf_config, "get_text_config"):
+            self.base_hf_config: AutoConfig = base_hf_config.get_text_config()
+        else:
+            self.base_hf_config: AutoConfig = base_hf_config
         self.max_loras_per_batch: int = max_loras_per_batch
         self.load_config: LoadConfig = load_config
         self.dtype: torch.dtype = dtype
@@ -82,6 +85,10 @@ class LoRAManager:
         self._experts_shared_outer_override: Optional[bool] = (
             server_args.experts_shared_outer_loras
         )
+
+        # Shared outer LoRA mode for MoE (Thinker format)
+        self.experts_shared_outer_loras: bool = server_args.experts_shared_outer_loras
+        self.lora_use_virtual_experts: bool = server_args.lora_use_virtual_experts
 
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
@@ -301,7 +308,6 @@ class LoRAManager:
         """
         for layer_id, layer_modules in enumerate(self.lora_modules):
             for module_name, module in layer_modules.items():
-                # Hack for FusedMoE layer
                 if isinstance(module, FusedMoEWithLoRA) and all(
                     x in self.target_modules for x in ["gate_up_proj", "down_proj"]
                 ):
@@ -717,6 +723,19 @@ class LoRAManager:
                     continue
 
             # The module should be converted if it is included in target_names
+            if (
+                "fused_qkv_a_proj_with_mqa" in self.target_modules
+                and module_name.endswith("fused_qkv_a_proj_with_mqa")
+            ):
+                from sglang.srt.lora.layers import ReplicatedLinearWithLoRA
+
+                layer_id = get_layer_id(module_name)
+                lora_module = self.set_lora_module(module_name, module)
+                if isinstance(lora_module, ReplicatedLinearWithLoRA):
+                    q_lora_rank = getattr(self.base_hf_config, "q_lora_rank", None) or 0
+                    lora_module.first_output_dim = q_lora_rank
+                self.lora_modules[layer_id][module_name] = lora_module
+                continue
             if module_name.split(".")[-1] in self.target_modules:
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
@@ -724,12 +743,21 @@ class LoRAManager:
                 self.lora_modules[layer_id][module_name] = self.set_lora_module(
                     module_name, module
                 )
-                continue
 
             if isinstance(module, FusedMoE) and all(
                 x in self.target_modules for x in ["gate_up_proj", "down_proj"]
             ):
+                if "shared_experts" in module_name:
+                    continue
+                if self.lora_backend.name != "triton":
+                    logger.warning(
+                        "Current LoRA backend does not support LoRA on MoE layers; "
+                        "skipping MoE layer."
+                    )
+                    continue
+
                 layer_id = get_layer_id(module_name)
                 lora_module = self.set_lora_module(module_name, module)
                 lora_module.experts_shared_outer_loras = self.experts_shared_outer_loras
+                lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts
                 self.lora_modules[layer_id][module_name] = lora_module

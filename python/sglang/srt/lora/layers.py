@@ -1,8 +1,11 @@
+import logging
 from typing import Dict, Optional, Union
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -14,6 +17,7 @@ from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -83,9 +87,23 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         if hasattr(base_layer, "tp_size") and base_layer.tp_size > 1:
             from sglang.srt.layers.communicator import get_attn_tp_context
 
-            assert (
-                not get_attn_tp_context().allow_input_scattered
-            ), "VocabParallelEmbeddingWithLoRA with TP > 1 under input_scattered mode (e.g., DeepSeek-v2 MLA with --enable-attn-tp-input-scattered) is not fully supported and may produce incorrect results. Consider disabling input_scattered or removing embed_tokens from LoRA target modules."
+            if get_attn_tp_context().allow_input_scattered:
+                logger.warning(
+                    "VocabParallelEmbeddingWithLoRA with TP > 1 under "
+                    "input_scattered mode (e.g., DeepSeek-v2 MLA with "
+                    "--enable-attn-tp-input-scattered) is not fully "
+                    "supported and may produce incorrect results. "
+                    "Consider disabling input_scattered or removing "
+                    "embed_tokens from LoRA target modules."
+                )
+            else:
+                logger.warning(
+                    "VocabParallelEmbeddingWithLoRA with TP > 1: LoRA "
+                    "weights are fully replicated (unsharded) on every "
+                    "rank, which increases memory usage. If you encounter "
+                    "OOM, consider implementing a sharded embedding LoRA "
+                    "kernel and the corresponding weight-slicing logic."
+                )
 
         self.output_offset = torch.tensor(
             [0, self.embed_dim],
@@ -629,7 +647,6 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         return lora_output
 
     def forward(self, input_: torch.Tensor, skip_all_reduce=False):
-        # duplicate the logic in RowParallelLinear
         if self.base_layer.input_is_parallel:
             input_parallel = input_
         else:
@@ -638,8 +655,14 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
                 input_, num_partitions=self.base_layer.tp_size
             )
             input_parallel = splitted_input[tp_rank].contiguous()
+
+        bias_ = (
+            None
+            if (self.base_layer.tp_rank > 0 or self.base_layer.skip_bias_add)
+            else self.base_layer.bias
+        )
         output_parallel = self.base_layer.quant_method.apply(
-            self.base_layer, input_parallel
+            self.base_layer, input_parallel, bias=bias_
         )
 
         should_reduce = (
@@ -668,23 +691,77 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             else:
                 output_ = output_parallel
 
-        if not self.base_layer.skip_bias_add:
-            output = (
-                output_ + self.base_layer.bias
-                if self.base_layer.bias is not None
-                else output_
-            )
-            output_bias = None
-        else:
-            output = output_
-            output_bias = self.base_layer.bias
-        return output, output_bias
+        output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
+        return output_, output_bias
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         shard_size = self.base_layer.input_size_per_partition
         start_idx = tp_rank * shard_size
         end_idx = (tp_rank + 1) * shard_size
         A = A[:, start_idx:end_idx].contiguous()
+        return A
+
+    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+        return B
+
+
+class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
+    """LoRA wrapper for ReplicatedLinear (no TP sharding).
+
+    Used for DeepSeek MLA's fused_qkv_a_proj_with_mqa, which fuses
+    q_a_proj and kv_a_proj_with_mqa into a single replicated linear.
+    The two sub-projections have unequal output dimensions, so we apply
+    LoRA B via two separate sgemm calls, one per partition.
+
+    ``first_output_dim`` (set by LoRAManager after construction) marks the
+    boundary between the first and second sub-projection in the output.
+    """
+
+    first_output_dim: int = 0
+
+    def __init__(
+        self,
+        base_layer: ReplicatedLinear,
+        lora_backend: BaseLoRABackend,
+    ) -> None:
+        super().__init__(base_layer, lora_backend)
+        self.output_size = base_layer.output_size
+
+    def set_lora_info(self, A_buffer: torch.Tensor, B_buffer: torch.Tensor):
+        self.set_lora = True
+        self.A_buffer = A_buffer
+        self.B_buffer = B_buffer
+
+    def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        rank = self.B_buffer.shape[-1]
+        first_dim = self.first_output_dim
+
+        lora_a_output = self.lora_backend.run_lora_a_sgemm(
+            x, self.A_buffer, stack_num=2
+        )
+
+        lora_a_first = lora_a_output[:, :rank].contiguous()
+        lora_a_second = lora_a_output[:, rank:].contiguous()
+        B_first = self.B_buffer[:, :first_dim, :].contiguous()
+        B_second = self.B_buffer[:, first_dim:, :].contiguous()
+
+        first_out = self.lora_backend.run_lora_b_sgemm(lora_a_first, B_first)
+        second_out = self.lora_backend.run_lora_b_sgemm(lora_a_second, B_second)
+
+        base_output[:, :first_dim] += first_out
+        base_output[:, first_dim:] += second_out
+        return base_output
+
+    def forward(self, x: torch.Tensor):
+        bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
+        assert self.base_layer.quant_method is not None
+        output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
+        if self.set_lora:
+            output = self.apply_lora(output, x)
+        output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
+        return output, output_bias
+
+    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         return A
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
@@ -699,8 +776,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     1. After gate_up projection, BEFORE activation (halfway through)
     2. After down projection, BEFORE final reduction
 
-    This follows the vLLM/HF approach where LoRA is fused into the computation
-    rather than computed independently and added at the end.
+    Supports CUDA graph capture via pre-allocated buffers and expert-shared
+    outer LoRA weights.
     """
 
     def __init__(
@@ -708,35 +785,123 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         base_layer: FusedMoE,
         lora_backend: BaseLoRABackend,
     ):
-        # initializes FusedMoE with its own moe_runner for base path
         super().__init__(base_layer, lora_backend)
 
         self.experts_shared_outer_loras: bool = False
+        self.lora_use_virtual_experts: bool = False
         self.quant_method = base_layer.quant_method
 
         self.tp_size = getattr(base_layer, "moe_tp_size", 1)
         self.tp_rank = getattr(base_layer, "moe_tp_rank", 0)
+        self.quant_method = (
+            base_layer.quant_method
+        )  # forwarded; LoRA weights are not quantized
         self.intermediate_size_per_partition = getattr(
             base_layer, "intermediate_size_per_partition", None
         )
 
-        # initialize triton_lora moe runner for batches with lora enabled
+        # Initialize triton_lora moe runner for batches with lora enabled
+        from sglang.srt.layers.moe import MoeRunnerBackend
         from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
-        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+        from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+        # Determine runner backend: prefer server arg, fall back to quant method's runner
+        global_backend = get_moe_runner_backend()
+        if not global_backend.is_auto():
+            runner_backend = global_backend
+        elif (
+            hasattr(base_layer.quant_method, "runner")
+            and base_layer.quant_method.runner is not None
+        ):
+            runner_backend = base_layer.quant_method.runner.runner_backend
+        else:
+            runner_backend = MoeRunnerBackend.TRITON
 
         self._lora_runner = MoeRunner(
-            base_layer.quant_method.runner.runner_backend,
+            runner_backend,
             base_layer.moe_runner_config,
             lora_enabled=True,
         )
 
-        # Pre-compute quant info for efficiency (weights don't change during inference)
-        self._quant_info = TritonMoeQuantInfo(
-            w13_weight=base_layer.w13_weight,
-            w2_weight=base_layer.w2_weight,
-            b13=getattr(base_layer, "w13_weight_bias", None),
-            b2=getattr(base_layer, "w2_weight_bias", None),
+        if runner_backend.is_marlin():
+            self._quant_info = base_layer.quant_method.get_marlin_quant_info(base_layer)
+        else:
+            self._quant_info = base_layer.quant_method.get_triton_quant_info(base_layer)
+
+    def init_cuda_graph_buffers(
+        self, max_bs: int, max_loras: int, compute_dtype: torch.dtype = torch.bfloat16
+    ):
+        """Pre-allocate intermediate buffers for CUDA graph capture/replay.
+
+        Must be called before init_memory_pool() so that profile_max_num_token()
+        accounts for this memory when sizing the KV cache.
+        """
+        from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+
+        base = self.base_layer
+        top_k = base.top_k
+        qinfo = self._quant_info
+        if isinstance(qinfo, TritonMoeQuantInfo):
+            E, N, _ = qinfo.w13_weight.shape
+            hidden_dim = qinfo.w2_weight.shape[1]
+            device = qinfo.w13_weight.device
+        else:
+            assert isinstance(
+                qinfo, MarlinMoeQuantInfo
+            ), "Only TritonMoeQuantInfo and MarlinMoeQuantInfo are supported"
+            E, N, _ = qinfo.w13_qweight.shape
+            hidden_dim = qinfo.w2_qweight.shape[1]
+            device = qinfo.w13_qweight.device
+        dtype = compute_dtype
+        num_experts = base.num_experts
+
+        block_size_m = 64
+        max_num_tokens_padded = max_bs * top_k + num_experts * (block_size_m - 1)
+        max_num_tokens_padded = (
+            (max_num_tokens_padded + block_size_m - 1) // block_size_m
+        ) * block_size_m
+        max_num_m_blocks = (max_num_tokens_padded + block_size_m - 1) // block_size_m
+
+        max_lora_rank = (
+            self.base_layer.moe_runner_config.max_lora_rank
+            if hasattr(self.base_layer.moe_runner_config, "max_lora_rank")
+            else 32
         )
+
+        self._cg_buffers = {
+            "intermediate_cache1": torch.empty(
+                (max_bs, top_k, N), device=device, dtype=dtype
+            ),
+            "intermediate_cache2": torch.empty(
+                (max_bs * top_k, N // 2), device=device, dtype=dtype
+            ),
+            "intermediate_cache3": torch.empty(
+                (max_bs, top_k, hidden_dim), device=device, dtype=dtype
+            ),
+            "out_hidden_states": torch.empty(
+                (max_bs, hidden_dim), device=device, dtype=dtype
+            ),
+            "sorted_token_ids_lora": torch.empty(
+                (max_loras * max_num_tokens_padded,), device=device, dtype=torch.int32
+            ),
+            "expert_ids_lora": torch.empty(
+                (max_loras * max_num_m_blocks,), device=device, dtype=torch.int32
+            ),
+            "num_tokens_post_padded_lora": torch.empty(
+                (max_loras,), device=device, dtype=torch.int32
+            ),
+            "adapter_enabled": torch.zeros(max_loras, dtype=torch.int32, device=device),
+            "lora_ids": torch.arange(max_loras, dtype=torch.int32, device=device),
+            "cumsum_buffer": torch.zeros(
+                max_loras * (num_experts + 1), dtype=torch.int32, device=device
+            ),
+            "token_mask": torch.empty(
+                (max_loras * max_bs * top_k,), dtype=torch.int32, device=device
+            ),
+            "max_num_tokens_padded": max_num_tokens_padded,
+            "max_num_m_blocks": max_num_m_blocks,
+        }
 
     def set_lora_info(
         self,
@@ -753,26 +918,30 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.down_lora_b_weights = down_lora_b_weights
 
     def _get_lora_info(self):
-        """
-        Build LoRAInfo for the current batch.
+        """Build LoRAInfo for the current batch.
 
-        Returns None if LoRA is not enabled or weights are not set.
+        Reuses pre-allocated buffers when running under CUDA graph capture.
         """
         from sglang.srt.lora.lora_moe_runners import LoRAInfo
 
-        # Get LoRA batch info from backend
         batch_info = self.lora_backend.batch_info
-        lora_ranks = batch_info.lora_ranks  # [num_loras]
+        lora_ranks = batch_info.lora_ranks
 
         max_lora_rank = self.down_lora_a_weights.shape[2]
 
-        # Create adapter_enabled tensor for the current batch
-        # Only enable LoRA adapters that are actually used in this batch
-        # TODO: Jonahbernard: check that this doesn't slow down inference for this batch
-        adapter_enabled = torch.zeros(
-            len(lora_ranks), dtype=torch.int32, device=lora_ranks.device
-        )
-        adapter_enabled.index_fill_(0, batch_info.weight_indices.long(), 1)
+        # Create adapter_enabled tensor — reuse from CUDA graph buffers if available
+        cg_buffers = getattr(self, "_cg_buffers", None)
+        if cg_buffers is not None and batch_info.use_cuda_graph:
+            adapter_enabled = cg_buffers["adapter_enabled"]
+            adapter_enabled.zero_()
+            adapter_enabled.index_fill_(
+                0, batch_info.weight_indices[: batch_info.bs].long(), 1
+            )
+        else:
+            adapter_enabled = torch.zeros(
+                len(lora_ranks), dtype=torch.int32, device=lora_ranks.device
+            )
+            adapter_enabled.index_fill_(0, batch_info.weight_indices.long(), 1)
 
         return LoRAInfo(
             gate_up_lora_a_weights=self.gate_up_lora_a_weights,
@@ -786,24 +955,21 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             max_lora_rank=max_lora_rank,
             num_experts=self.base_layer.num_experts,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
+            cg_buffers=cg_buffers,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             hidden_size=getattr(self.base_layer, "hidden_size", 0),
+            lora_use_virtual_experts=self.lora_use_virtual_experts,
         )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
-        """
-        Forward pass with integrated LoRA computation.
+        """Forward pass with integrated LoRA computation.
 
         LoRA deltas are added at the correct points inside the MoE computation:
         1. After gate_up projection, before activation
         2. After down projection, before final reduction
         """
-
-        # Build LoRA info for this batch
         lora_info = self._get_lora_info()
-
-        # run lora moe_runner
         return self._forward_with_lora(hidden_states, topk_output, lora_info, **kwargs)
 
     def _forward_with_lora(
@@ -813,21 +979,15 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         lora_info,
         **kwargs,
     ):
-        """
-        Run MoE forward with LoRA integration at the correct points.
-        """
-        # Get the base layer's dispatch and combine logic
+        """Run MoE forward with LoRA integration at the correct points."""
         base_layer = self.base_layer
 
-        # Dispatch tokens (doesn't do much in the LoRA case)
         dispatch_output = base_layer.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
 
-        # Use pre-computed quant info (doesn't change so not sure why we need to pass it in every time)
         quant_info = self._quant_info
 
-        # Run the only lora moe runner (Triton)
         combine_input = self._lora_runner.run(
             dispatch_output, quant_info, lora_info=lora_info
         )
@@ -935,6 +1095,7 @@ def get_lora_layer(
         FusedMoE: FusedMoEWithLoRA,
         ParallelLMHead: ParallelLMHeadWithLoRA,
         VocabParallelEmbedding: VocabParallelEmbeddingWithLoRA,
+        ReplicatedLinear: ReplicatedLinearWithLoRA,
         QKVParallelLinear: QKVParallelLinearWithLoRA,
         MergedColumnParallelLinear: MergedColumnParallelLinearWithLoRA,
         ColumnParallelLinear: ColumnParallelLinearWithLoRA,

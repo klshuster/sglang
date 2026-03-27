@@ -84,6 +84,7 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
         runner_input: TritonKernelsRunnerInput,
         quant_info: TritonKernelsQuantInfo,
         running_state: dict,
+        hooks=None,
     ) -> TritonKernelsRunnerOutput:
         from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
             triton_kernel_fused_experts,

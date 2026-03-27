@@ -120,6 +120,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         runner_input: DeepGemmRunnerInput,
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
+        hooks=None,
     ) -> DeepGemmRunnerOutput:
         if not runner_input.use_masked_gemm:
             hidden_states = self._run_contiguous_gemm(
