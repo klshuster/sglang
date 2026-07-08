@@ -64,5 +64,26 @@ class TestTritonDeterministic(TestDeterministicBase):
         return args
 
 
+class TestDeterministicWorkspaceFloor(unittest.TestCase):
+    def test_user_override_survives(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            DETERMINISTIC_WORKSPACE_SIZE_FLOOR,
+            ensure_deterministic_workspace_size,
+        )
+
+        # a user-provided workspace above the floor must not be clobbered
+        with envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.override(6 * 1024**3):
+            ensure_deterministic_workspace_size()
+            self.assertEqual(envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(), 6 * 1024**3)
+
+        with envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.override(384 * 1024 * 1024):
+            ensure_deterministic_workspace_size()
+            self.assertEqual(
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                DETERMINISTIC_WORKSPACE_SIZE_FLOOR,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
