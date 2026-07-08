@@ -555,6 +555,18 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             req.req_pool_idx, :kv_len_to_handle
         ]
 
+        # Finished-request tips diverge from a cold recompute: decode-program
+        # states always; prefill states too when the boundary is off the
+        # mamba chunk grid (a cold run would chunk at aligned positions).
+        aligned_prefill_only = (
+            len(req.output_ids) <= 1
+            and len(req.origin_input_ids) % self.mamba_cache_chunk_size == 0
+        )
+        if not aligned_prefill_only:
+            is_insert = (
+                is_insert and not get_server_args().disable_finished_mamba_cache
+            )
+
         if is_insert:
             if self.enable_mamba_extra_buffer:
                 cache_len = req.mamba_last_track_seqlen

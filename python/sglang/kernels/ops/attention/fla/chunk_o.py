@@ -11,6 +11,7 @@ import triton.language as tl
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.op import exp, safe_exp
 from sglang.kernels.ops.attention.fla.utils import check_shared_mem, is_nvidia_hopper
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
@@ -136,6 +137,10 @@ def chunk_fwd_o(
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
     BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+    # the BT shrink makes tiling depend on the batch's total token count;
+    # batch-invariant mode pins the tile (partial tiles are boundary-masked)
+    if is_batch_invariant_mode_enabled():
+        BT = chunk_size
     chunk_indices = (
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     )

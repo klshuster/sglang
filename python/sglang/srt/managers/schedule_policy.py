@@ -459,8 +459,10 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        truncation_align_size: Optional[int] = None,
     ):
         self.page_size = page_size
+        self.truncation_align_size = truncation_align_size
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
@@ -898,6 +900,17 @@ class PrefillAdder:
             req.prefix_indices
         )
         truncated = cand_extend_input_len > _rem_tokens
+        # Keep chunk boundaries on multiples of truncation_align_size (prefix is
+        # aligned inductively); defer when the round budget is under one unit.
+        if truncated and self.truncation_align_size is not None:
+            if _rem_tokens < self.truncation_align_size:
+                # park: block new chunk admissions so the scheduler cannot
+                # start a second chunked request while this one waits
+                self.rem_chunk_tokens = 0
+                return req
+            _rem_tokens = self.truncation_align_size * (
+                _rem_tokens // self.truncation_align_size
+            )
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
@@ -1039,6 +1052,13 @@ class PrefillAdder:
 
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
+            # same aligned-boundary contract as add_chunked_req
+            if self.truncation_align_size is not None:
+                if trunc_len < self.truncation_align_size:
+                    return AddReqResult.OTHER
+                trunc_len = self.truncation_align_size * (
+                    trunc_len // self.truncation_align_size
+                )
 
             assert len(req.prefix_indices) == 0
             req.set_extend_range(

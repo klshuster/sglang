@@ -599,6 +599,20 @@ class UnifiedRadixCache(BasePrefixCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
+        if is_insert and self.supports_mamba():
+            from sglang.srt.runtime_context import get_server_args
+
+            server_args = get_server_args()
+            # Finished-request tips diverge from a cold recompute: decode-program
+            # states always; prefill states too when the boundary is off the
+            # mamba chunk grid (a cold run would chunk at aligned positions).
+            aligned_prefill_only = (
+                len(req.output_ids) <= 1
+                and kv_len_to_handle % server_args.mamba_cache_chunk_size == 0
+            )
+            if not aligned_prefill_only:
+                is_insert = not server_args.disable_finished_mamba_cache
+
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
 

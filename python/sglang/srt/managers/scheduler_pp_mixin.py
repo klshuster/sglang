@@ -792,6 +792,15 @@ class SchedulerPPMixin:
             max_chunk_size=max_chunk_size,
         )
 
+        if predicted_size is not None and self.truncation_align_size is not None:
+            # chunk boundaries must stay truncation-aligned (deterministic hybrid)
+            predicted_size = max(
+                self.truncation_align_size,
+                predicted_size
+                // self.truncation_align_size
+                * self.truncation_align_size,
+            )
+
         if predicted_size is not None:
             logger.debug(
                 f"[PP Dynamic Chunk] [PP{self.ps.pp_rank}] Predicted chunk size: "

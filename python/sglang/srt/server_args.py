@@ -2489,6 +2489,14 @@ class ServerArgs:
     mamba_track_interval: A[
         int, "The interval to track the mamba state during decode.", NS("exec.mamba")
     ] = 256
+    disable_finished_mamba_cache: A[
+        bool,
+        "Skip inserting finished requests' mamba states (tips) into the radix "
+        "tree. Tips are decode-program states; prefix hits on them make cached "
+        "results diverge from a cold recompute. Recommended (with a large "
+        "--mamba-track-interval) whenever deterministic inference is used with "
+        "the radix cache on mamba-family archs.",
+    ] = False
     enable_int8_mamba_checkpoint: A[
         bool,
         "Store radix-cached linear-attn (mamba) states in int8 (separate checkpoint pool) for ~2x cached-prefix capacity at fixed memory.",
@@ -7673,6 +7681,13 @@ class ServerArgs:
             envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(True)
 
         if self.enable_deterministic_inference:
+            # Finished-request mamba tips are decode-program states; prefix
+            # hits on them diverge from a prefill recompute of the same tokens.
+            self.disable_finished_mamba_cache = True
+            logger.info(
+                "Disable finished-request mamba cache insertion for deterministic inference."
+            )
+
             if self.enable_aiter_allreduce_fusion:
                 logger.warning(
                     "Disable --enable-aiter-allreduce-fusion because deterministic inference is enabled."

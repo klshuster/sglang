@@ -111,7 +111,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
             block_shape=(BT, BV),
         )
 
-    index = tl.load(initial_state_indices + i_n).to(tl.int32)
+    # int64: index * stride_h overflows int32 on large state pools and the
+    # wrap silently reads/writes another slot's state
+    index = tl.load(initial_state_indices + i_n).to(tl.int64)
     h0 = initial_state + index * stride_h
     ht = initial_state + index * stride_h
     if USE_INITIAL_STATE:

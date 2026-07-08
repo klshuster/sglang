@@ -16,6 +16,7 @@
 import dataclasses
 import faulthandler
 import logging
+import math
 import os
 import signal
 import sys
@@ -1424,10 +1425,15 @@ class Scheduler(
             self.ngram_embedding_k = hf_config.ngram_embedding_k
 
     def init_deterministic_inference_config(self):
-        """Initialize deterministic inference configuration for different attention backends."""
+        """Chunk boundaries must land on a multiple of this size: LCM of the
+        mamba-cache chunk (hybrid SSM) and the backend's prefill split tile."""
         if not get_exec().deterministic.enable_deterministic_inference:
             self.truncation_align_size = None
             return
+
+        self.truncation_align_size = (
+            self.server_args.mamba_cache_chunk_size if self.is_hybrid_ssm else None
+        )
 
         backend_sizes = {
             "flashinfer": ("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096),
@@ -1436,9 +1442,26 @@ class Scheduler(
         env_var, default_size = backend_sizes.get(
             self.server_args.attention_backend, (None, None)
         )
-        self.truncation_align_size = (
+        deterministic_align_size = (
             get_int_env_var(env_var, default_size) if env_var else None
         )
+        if deterministic_align_size is not None:
+            if self.truncation_align_size is None:
+                self.truncation_align_size = deterministic_align_size
+            else:
+                self.truncation_align_size = math.lcm(
+                    self.truncation_align_size, deterministic_align_size
+                )
+        chunk = self.chunked_prefill_size
+        if (
+            self.truncation_align_size is not None
+            and chunk is not None
+            and 0 < chunk < self.truncation_align_size
+        ):
+            raise ValueError(
+                f"--chunked-prefill-size {chunk} cannot fit one truncation-aligned "
+                f"unit ({self.truncation_align_size}); raise it or pass -1"
+            )
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -3110,6 +3133,7 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            truncation_align_size=self.truncation_align_size,
         )
 
         if self.chunked_req is not None:
@@ -3220,7 +3244,7 @@ class Scheduler(
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
-        if self.chunked_req is not None:
+        if self.chunked_req is not None and self.chunked_req in can_run_set:
             self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
