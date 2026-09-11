@@ -1046,11 +1046,14 @@ class TestSWAPoolFloor(CustomTestCase):
 
     def _dsv4_sizes(self, max_tokens, page_size, unified=False):
         """Exercise the DSV4 size arithmetic without a full V4 model fixture:
-        _compute_dsv4_sizes reads only these six attributes."""
+        _compute_dsv4_sizes reads only these attributes."""
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
         cfg = object.__new__(DSV4PoolConfigurator)
         cfg.swa_ratio = 0.1
+        cfg.operator_swa_ratio = None
+        cfg.swa_cap_tokens = None
+        cfg.swa_prefix_tails = 0
         cfg.sliding_window_size = 128
         cfg.swa_page_size = 128
         cfg.c4_ring_size = 8
@@ -1111,6 +1114,11 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg.bytes_per_full_token = 576.0
         cfg.requested_max_running_requests_per_worker = None
         cfg.swa_ratio = 0.1
+        cfg.operator_swa_ratio = None
+        cfg.swa_cap_tokens = None
+        cfg.swa_prefix_tails = 0
+        cfg.encoder_replay = False
+        cfg.request_window_bytes = 0
         cfg.sliding_window_size = 4096
         cfg.swa_page_size = 128
         cfg.c4_shrink_factor = 1
