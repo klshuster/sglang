@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.utils import is_hip, is_xpu
 
+from .kv_layout import KVLayout
 from .utils import make_name
 
 _is_xpu = is_xpu()
@@ -48,17 +49,19 @@ def _jit_compress_norm_rope_module(
     head_dim: int,
     rope_dim: int,
     page_size: int,
-    bf16_store: bool = False,
-    fp8_2buff: bool = False,
+    bf16_store: bool,
+    fp8_2buff: bool,
+    layout: KVLayout,
 ) -> Module:
     args = make_cpp_args(
         dtype,
         head_dim,
         rope_dim,
         page_size,
-        is_arch_support_pdl(),
         INDEXER_K_CACHE_PRESHUFFLE_TILE if aiter_can_use_preshuffle_paged_mqa() else 0,
         bf16_store,
+        layout.cpp_name,
+        is_arch_support_pdl(),
     )
     cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
     if head_dim == 128:
@@ -457,7 +460,16 @@ def compress_norm_rope_store(
     fp4_k_write_metadata=None,
     fp8_2buff: bool = False,
     kvcache_rope: Optional[torch.Tensor] = None,
+    # Page layout of a FlashMLA (head_dim 512) main-KV cache: the 584-byte V4
+    # layout, or the V4.1 fp8 / fp4 formats (CUDA only).
+    layout: Union[KVLayout, str] = KVLayout.V4,
 ) -> None:
+    layout = KVLayout.parse(layout)
+    if layout is not KVLayout.V4:
+        assert kv.shape[-1] == 512 and not use_fp4 and not bf16_store, (
+            "the V4.1 layouts are paged FlashMLA main-KV caches"
+        )
+        assert not is_hip() and not _is_xpu, "the V4.1 KV layouts are CUDA (sm100) only"
     if use_fp4:
         assert kv.shape[-1] == 128
     if is_hip() and use_fp4:
@@ -508,6 +520,7 @@ def compress_norm_rope_store(
             page_size,
             bf16_store,
             fp8_2buff,
+            layout,
         )
         if use_fp4:
             fn, extra = module.forward_fp4, ()
