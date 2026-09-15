@@ -100,9 +100,11 @@ def resolve_compressed_kv_layout(
     """
     if option is not None:
         option = option.lower()
-        assert option in ("auto", "fp8", "fp4"), (
-            f"unknown compressed KV layout {option!r}"
-        )
+        assert option in (
+            "auto",
+            "fp8",
+            "fp4",
+        ), f"unknown compressed KV layout {option!r}"
         if option == "auto":
             option = None
     if kv_layout is KVLayout.V4:
@@ -459,7 +461,11 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
 # Low-ratio indexer-K pool page, in compressed slots: the DeepGEMM indexer reads
 # K in blocks of at most 128 and sglang's JIT metadata builder asserts 64.
 def dsv41_index_page_size() -> int:
-    if envs.SGLANG_DSV41_DEEP_GEMM_CANDIDATE_INDEXER.get():
+    from sglang.srt.layers.deep_gemm_wrapper.configurer import (
+        DEEPGEMM_SPARSE_INDEXER,
+    )
+
+    if DEEPGEMM_SPARSE_INDEXER:
         return 128
     return 64
 
@@ -896,9 +902,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # resolve_compressed_kv_layout, so every (main, extra) pair the decode
         # kernel accepts is formed here and nowhere else.
         self.kv_layout = KVLayout.parse(kv_layout)
-        assert self.kv_layout in (KVLayout.V4, KVLayout.V41), (
-            f"{self.kv_layout} is only valid for a compressed (extra) cache"
-        )
+        assert self.kv_layout in (
+            KVLayout.V4,
+            KVLayout.V41,
+        ), f"{self.kv_layout} is only valid for a compressed (extra) cache"
         self.compressed_kv_layout_option = compressed_kv_layout
         c4_logical_size = c128_size * 32
 
@@ -949,18 +956,28 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             c128_state_pool_size = max(
                 c128_state_pool_size, self.num_req_slots * c128_ring_size
             )
+        # Only the ratios the model has anywhere get a pool config: DeepSeek-V4.1
+        # has no c4 / c128 layers, and the backend, PD state transfer and HiCache
+        # read the pool registries as "the ratios this model has". A PP stage
+        # that lacks one of the model's ratios still keeps its (empty) pool so
+        # the PD wire layout stays aligned across stages.
+        model_ratios = set(compression_ratios)
         self.compressed_pool_configs = {
-            4: _CompressedPoolConfig(
-                kv_size=c4_size,
-                state_size=c4_state_pool_size,
-                state_dtype=c4_state_dtype,
-                indexer_size=c4_logical_size,
-            ),
-            128: _CompressedPoolConfig(
-                kv_size=c128_size,
-                state_size=c128_state_pool_size,
-                state_dtype=c128_state_dtype,
-            ),
+            ratio: config
+            for ratio, config in {
+                4: _CompressedPoolConfig(
+                    kv_size=c4_size,
+                    state_size=c4_state_pool_size,
+                    state_dtype=c4_state_dtype,
+                    indexer_size=c4_logical_size,
+                ),
+                128: _CompressedPoolConfig(
+                    kv_size=c128_size,
+                    state_size=c128_state_pool_size,
+                    state_dtype=c128_state_dtype,
+                ),
+            }.items()
+            if ratio in model_ratios
         }
         self.compression_ratios = compression_ratios
         self.online_mtp_max_draft_tokens = online_mtp_max_draft_tokens
@@ -1422,10 +1439,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 force_fp4=True,
             )
 
-        # HiCache and hardware backends still access the per-ratio attributes.
-        self.c4_kv_pool = self.kv_pools[4]
-        self.c128_kv_pool = self.kv_pools[128]
-        self.c4_indexer_kv_pool = self.index_pools[4]
+        # HiCache and hardware backends still access the per-ratio attributes;
+        # None when the model has no layer of that ratio (DeepSeek-V4.1).
+        self.c4_kv_pool = self.kv_pools.get(4)
+        self.c128_kv_pool = self.kv_pools.get(128)
+        self.c4_indexer_kv_pool = self.index_pools.get(4)
 
     def _make_kv_pool(
         self,

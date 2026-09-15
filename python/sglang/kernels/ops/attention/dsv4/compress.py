@@ -50,8 +50,8 @@ def _jit_compress_norm_rope_module(
     rope_dim: int,
     page_size: int,
     bf16_store: bool,
-    fp8_2buff: bool,
     layout: KVLayout,
+    fp8_2buff: bool = False,
 ) -> Module:
     args = make_cpp_args(
         dtype,
@@ -458,11 +458,11 @@ def compress_norm_rope_store(
     kvcache_scale: Optional[torch.Tensor] = None,
     rope_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     fp4_k_write_metadata=None,
-    fp8_2buff: bool = False,
-    kvcache_rope: Optional[torch.Tensor] = None,
     # Page layout of a FlashMLA (head_dim 512) main-KV cache: the 584-byte V4
     # layout, or the V4.1 fp8 / fp4 formats (CUDA only).
     layout: Union[KVLayout, str] = KVLayout.V4,
+    fp8_2buff: bool = False,
+    kvcache_rope: Optional[torch.Tensor] = None,
 ) -> None:
     layout = KVLayout.parse(layout)
     if layout is not KVLayout.V4:
@@ -494,6 +494,7 @@ def compress_norm_rope_store(
 
     if fp8_2buff:
         assert not (use_fp4 or bf16_store), "fp8 two-pool store is its own layout"
+        assert layout is KVLayout.V4, "fp8 two-pool store is a V4 (584 B page) cache"
         assert kv.shape[-1] != 128, "fp8 two-pool store is the latent, not the indexer"
         assert kvcache_rope is not None, "fp8 two-pool store needs the rope pool"
         assert not _is_xpu, "fp8 two-pool store is only wired for the CUDA/HIP kernel"
@@ -519,8 +520,8 @@ def compress_norm_rope_store(
             freq_cis.shape[-1],
             page_size,
             bf16_store,
-            fp8_2buff,
             layout,
+            fp8_2buff,
         )
         if use_fp4:
             fn, extra = module.forward_fp4, ()

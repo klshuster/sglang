@@ -159,9 +159,9 @@ class CompressorBackendMixin:
         bf16_store: bool = False,
         kv_scale_cache: Optional[torch.Tensor] = None,
         rope_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        kv_layout: KVLayout = KVLayout.V4,
         fp8_2buff: bool = False,
         kv_cache_rope: Optional[torch.Tensor] = None,
-        kv_layout: KVLayout = KVLayout.V4,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -322,11 +322,11 @@ class CompressorBackendMixin:
             rope_cache=(
                 (compressor.fp4_cos, compressor.fp4_sin) if use_hip_fp4 else None
             ),
+            kv_layout=kv_layout,
             fp8_2buff=fp8_2buff,
             kv_cache_rope=(
                 None if kv_cache_rope is None else kv_cache_rope.view(dtype=torch.uint8)
             ),
-            kv_layout=kv_layout,
         )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
         if online_c128_mtp is not None:

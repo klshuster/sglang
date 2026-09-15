@@ -47,7 +47,6 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
-    get_server_args,
     get_spec,
     max_speculative_num_draft_tokens,
 )
@@ -930,12 +929,11 @@ DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO = 0.1
 
 
 def _operator_swa_full_tokens_ratio() -> Optional[float]:
-    """The operator's --swa-full-tokens-ratio, or None when it was not given.
-
-    Read from the pristine record: the resolved schedule bag carries the
-    declared fallback for an unset ratio, which must not count as a request.
-    """
-    return get_server_args().swa_full_tokens_ratio
+    """The operator's --swa-full-tokens-ratio, or None when it was not given."""
+    schedule = get_schedule()
+    if not schedule._swa_full_tokens_ratio_explicitly_set:
+        return None
+    return schedule.swa_full_tokens_ratio
 
 
 @dataclass
@@ -965,14 +963,25 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.indexer_head_dim = cfg.index_head_dim
         self.attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_fp8,
             is_unified_kv_triton,
+        )
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            dsv4_unified_row_bytes,
         )
 
         # Resolve the unified-kv gate before any sizing so the two cannot drift.
         self._unified = is_unified_kv_triton()
+        self._unified_fp8 = is_unified_kv_fp8()
+        # Row width across both unified pools: 1024 B bf16, 640 B fp8. Read from
+        # the pool module so sizing can't drift from the allocation.
+        self._unified_row_bytes = dsv4_unified_row_bytes(
+            self.qk_nope_head_dim, self.qk_rope_head_dim, self._unified_fp8
+        )
         if self._unified:
-            # Unified_kv stores the whole latent in bf16.
-            self.kv_bytes = self.attn_head_dim * 2
+            # Unified_kv stores the whole latent: one bf16 pool, or an fp8 nope
+            # pool plus a bf16 rope pool.
+            self.kv_bytes = self._unified_row_bytes
         else:
             # One FlashMLA-layout latent slot, in bytes.
             self.kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
@@ -1030,23 +1039,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_total = len(self.compression_ratios)
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
-
-        # Unified-KV uses a different physical layout than the non-unified V4 path:
-        #  * one row carries the full latent -- 1024 B bf16, or 640 B under
-        #    SGLANG_DSV4_UNIFIED_KV_FP8 (512 B fp8 nope + 128 B bf16 rope) -- not
-        #    that path's 584-byte fp8(nope) + bf16(rope) + scales cell.
-        #  * SWA is a fixed per-request ring (num_req_slots * ring_size),
-        #    independent of full_token, so it is a fixed *bias* rather than a
-        #    per-token term. Gate on the same switch the pool itself uses so the
-        #    sizing and the allocation never drift apart.
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_fp8,
-            is_unified_kv_triton,
-        )
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            dsv4_unified_row_bytes,
-        )
-
         # Ratio 1/2 kv_source layers keep one FlashMLA-layout latent and one packed
         # index key per compressed position. The low-ratio indexer pools are built
         # with force_fp4=True (deepseek_v4_memory_pool._init_low_ratio_pools), so
@@ -1060,19 +1052,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
             and cfg.compress_ratios[l] in (1, 2)
         )
-
-        self._unified = is_unified_kv_triton()
-        self._unified_fp8 = is_unified_kv_fp8()
-        self.attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        # Row width across both pools: 1024 B bf16, 640 B fp8. Read from the pool
-        # module so sizing can't drift from the allocation.
-        self._unified_row_bytes = dsv4_unified_row_bytes(
-            self.qk_nope_head_dim, self.qk_rope_head_dim, self._unified_fp8
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            dsv4_unified_row_bytes,
         )
-        if self._unified:
-            # Both unified layouts price every row (main KV and compressed c4/c128)
-            # at the pool's own row width: 1024 B bf16, 640 B fp8 nope + bf16 rope.
-            self.kv_bytes = self._unified_row_bytes
+
         # swa_page_size is the model's sliding window (cfg.window_size).
         self._swa_ring_size = get_swa_ring_size(self.swa_page_size, self.is_speculative)
         self._spec_infl = 1.0

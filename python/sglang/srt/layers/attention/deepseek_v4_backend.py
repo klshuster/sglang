@@ -200,6 +200,74 @@ def _create_flashmla_metadata():
     return flash_mla.get_mla_metadata()[0]
 
 
+# The head64 sm100 decode scheduling constants, and the partition count
+# `num_sm_parts` that goes with them. Not exported, so the fast schedule only
+# runs for the shape they are known for and FlashMLA's own shape check is what
+# catches it if they ever stop matching.
+_FLASHMLA_SCHED_BLOCK_SIZE_N = 64
+_FLASHMLA_SCHED_FIXED_OVERHEAD = 5
+
+
+@functools.lru_cache(maxsize=None)
+def _num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _fast_flashmla_sched_shape(q: torch.Tensor) -> bool:
+    return q.is_cuda and get_platform().is_blackwell and q.shape[-2] == 64
+
+
+def _maybe_precompute_flashmla_sched_meta(
+    flashmla_metadata,
+    *,
+    q: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: Optional[torch.Tensor],
+    extra_indices: Optional[torch.Tensor],
+    extra_topk_length: Optional[torch.Tensor],
+) -> None:
+    """Compute FlashMLA's split-KV schedule before it has to.
+
+    `sparse_decode_fwd` builds the schedule itself whenever it is handed none,
+    in a `<<<1, 32>>>` kernel whose partition loop runs on thread 0 and stores
+    each 32-byte entry to global memory. At the 152 partitions of a BS=1 step
+    that is 28 us, and a decode graph replays it on the critical path. Filling
+    the buffers here instead means FlashMLA finds them already populated and
+    skips its kernel; `decoding_sched_meta` produces the same schedule, bit for
+    bit, in about 9 us.
+
+    Only fires where FlashMLA would have computed -- when the scheduler holds no
+    buffers yet -- so this does not add work to the calls that already reuse one.
+    """
+    if flashmla_metadata is None:
+        return
+    if getattr(flashmla_metadata, "tile_scheduler_metadata", None) is not None:
+        return
+    if not _fast_flashmla_sched_shape(q):
+        return
+    from sglang.kernels.ops.attention.dsv4.decoding_sched_meta import (
+        META_INTS,
+        decoding_sched_meta,
+    )
+
+    b, s_q = q.shape[0], q.shape[1]
+    num_sm_parts = max(_num_sms(q.device.index) // s_q, 1)
+    meta = torch.empty((num_sm_parts, META_INTS), dtype=torch.int32, device=q.device)
+    num_splits = torch.empty((b + 1,), dtype=torch.int32, device=q.device)
+    decoding_sched_meta(
+        meta,
+        num_splits,
+        topk_length=topk_length,
+        extra_topk_length=extra_topk_length,
+        block_size_n=_FLASHMLA_SCHED_BLOCK_SIZE_N,
+        fixed_overhead_num_blocks=_FLASHMLA_SCHED_FIXED_OVERHEAD,
+        topk=indices.shape[-1],
+        extra_topk=0 if extra_indices is None else extra_indices.shape[-1],
+    )
+    flashmla_metadata.tile_scheduler_metadata = meta
+    flashmla_metadata.num_splits = num_splits
+
+
 def _expand_index_page_table(
     page_table: torch.Tensor,
     *,
@@ -503,6 +571,51 @@ class DSV4AttnMetadata:
             return self.c4_sparse_topk_lengths
         raise ValueError(f"invalid {compress_ratio=}")
 
+    def init_trtllm_sparse_buffers(self) -> None:
+        """Build decode tables with 128 SWA columns followed by compressed KV.
+
+        Indices use -1 for invalid entries; lens include all 128 SWA slots.
+        Only the c4 tail and lens are filled per layer.
+        """
+
+        num_tokens = self.seq_lens_casual.shape[0]
+        assert self.swa_page_indices.shape == (num_tokens, SWA_WINDOW)
+
+        # VarSeq reads rows to the 64-token tile boundary. Back every live view
+        # with an aligned parent whose extra rows contain inert values.
+        n_pad = (num_tokens + 63) // 64 * 64
+
+        def _tile_padded(fill, src=None, width=None):
+            shape = (n_pad,) if width is None else (n_pad, width)
+            buf = torch.full(shape, fill, **self.cuda_int32_kwargs)
+            if src is not None:
+                buf[:num_tokens].copy_(src)
+            return buf[:num_tokens]
+
+        if n_pad != num_tokens:
+            self.seq_lens_casual = _tile_padded(1, self.seq_lens_casual)
+            self.swa_page_indices = _tile_padded(
+                -1, self.swa_page_indices, width=SWA_WINDOW
+            )
+        self.trtllm_swa_lens = _tile_padded(SWA_WINDOW)
+        if self.c4_sparse_page_indices is not None:
+            w4 = self.c4_sparse_page_indices.shape[-1]
+            assert w4 % 4 == 0, f"{w4=}"
+            # Unwritten c4 rows must remain inert until the per-layer fill.
+            self.trtllm_c4_indices = _tile_padded(-1, width=SWA_WINDOW + w4)
+            self.trtllm_c4_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
+            self.trtllm_c4_lens = _tile_padded(SWA_WINDOW)
+        if self.c128_page_indices is not None:
+            w128 = self.c128_page_indices.shape[-1]
+            assert w128 % 4 == 0, f"{w128=}"
+            self.trtllm_c128_indices = _tile_padded(-1, width=SWA_WINDOW + w128)
+            self.trtllm_c128_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
+            self.trtllm_c128_indices[:, SWA_WINDOW:].copy_(self.c128_page_indices)
+            self.trtllm_c128_lens = _tile_padded(
+                SWA_WINDOW,
+                (self.c128_topk_lengths_clamp1 + SWA_WINDOW).to(torch.int32),
+            )
+
     def copy_(self, other: DSV4AttnMetadata) -> None:
         copy_metadata(
             src=other,
@@ -626,7 +739,9 @@ class DSV4AttnMetadata:
         for field_name in reference_assign_fields:
             setattr(self, field_name, getattr(other, field_name))
 
-    def init_compression_metadata(self, num_tokens: Optional[int] = None) -> None:
+    def init_compression_metadata(
+        self, num_tokens: Optional[int] = None, low_ratio_buffers=None
+    ) -> None:
         assert self.page_table.dim() == 2
         # CP pads causal metadata for per-rank partitioning, while cache-write
         # locations remain one-per-logical-token. num_tokens tracks that unpadded
@@ -671,6 +786,10 @@ class DSV4AttnMetadata:
 
         self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
 
+        if low_ratio_buffers is not None:
+            self.c1_out_loc, self.c1_topk_lengths_clamp1 = low_ratio_buffers[:2]
+            self.c2_out_loc, self.c2_topk_lengths_clamp1 = low_ratio_buffers[4:6]
+            return
         if 1 in self.low_ratios:
             self.c1_out_loc, self.c1_topk_lengths_clamp1 = (
                 _low_ratio_compression_metadata(
@@ -759,7 +878,7 @@ class DSV4AttnMetadata:
                 f"!= num_tokens={num_tokens} (must remain global for compressor write path)"
             )
 
-    def init_flashmla_related(self, is_prefill: bool = False):
+    def init_flashmla_related(self, is_prefill: bool = False, low_ratio_buffers=None):
         assert self.index_topk in (512, 1024), (
             f"unexpected index_topk={self.index_topk}; "
             "supported: 512 (small) or 1024 (large)"
@@ -789,6 +908,17 @@ class DSV4AttnMetadata:
         self.c0_flashmla_metadata = _create_flashmla_metadata()
         self.c4_flashmla_metadata = _create_flashmla_metadata() if has_c4 else None
         self.c128_flashmla_metadata = _create_flashmla_metadata() if has_c128 else None
+        if low_ratio_buffers is not None:
+            assert not is_prefill and self.low_ratios == (1, 2)
+            self.c1_sparse_topk_lengths, self.c1_sparse_page_indices = (
+                low_ratio_buffers[2:4]
+            )
+            self.c2_sparse_topk_lengths, self.c2_sparse_page_indices = (
+                low_ratio_buffers[6:8]
+            )
+            self.c1_flashmla_metadata = _create_flashmla_metadata()
+            self.c2_flashmla_metadata = _create_flashmla_metadata()
+            return
         if 1 in self.low_ratios:
             (
                 self.c1_sparse_topk_lengths,
@@ -860,51 +990,6 @@ def _prefill_graph_max_seq_len() -> Optional[int]:
     from sglang.srt.runtime_context import get_exec
 
     return get_exec().graph.cuda_graph_config.prefill.max_seq_len
-
-    def init_trtllm_sparse_buffers(self) -> None:
-        """Build decode tables with 128 SWA columns followed by compressed KV.
-
-        Indices use -1 for invalid entries; lens include all 128 SWA slots.
-        Only the c4 tail and lens are filled per layer.
-        """
-
-        num_tokens = self.seq_lens_casual.shape[0]
-        assert self.swa_page_indices.shape == (num_tokens, SWA_WINDOW)
-
-        # VarSeq reads rows to the 64-token tile boundary. Back every live view
-        # with an aligned parent whose extra rows contain inert values.
-        n_pad = (num_tokens + 63) // 64 * 64
-
-        def _tile_padded(fill, src=None, width=None):
-            shape = (n_pad,) if width is None else (n_pad, width)
-            buf = torch.full(shape, fill, **self.cuda_int32_kwargs)
-            if src is not None:
-                buf[:num_tokens].copy_(src)
-            return buf[:num_tokens]
-
-        if n_pad != num_tokens:
-            self.seq_lens_casual = _tile_padded(1, self.seq_lens_casual)
-            self.swa_page_indices = _tile_padded(
-                -1, self.swa_page_indices, width=SWA_WINDOW
-            )
-        self.trtllm_swa_lens = _tile_padded(SWA_WINDOW)
-        if self.c4_sparse_page_indices is not None:
-            w4 = self.c4_sparse_page_indices.shape[-1]
-            assert w4 % 4 == 0, f"{w4=}"
-            # Unwritten c4 rows must remain inert until the per-layer fill.
-            self.trtllm_c4_indices = _tile_padded(-1, width=SWA_WINDOW + w4)
-            self.trtllm_c4_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
-            self.trtllm_c4_lens = _tile_padded(SWA_WINDOW)
-        if self.c128_page_indices is not None:
-            w128 = self.c128_page_indices.shape[-1]
-            assert w128 % 4 == 0, f"{w128=}"
-            self.trtllm_c128_indices = _tile_padded(-1, width=SWA_WINDOW + w128)
-            self.trtllm_c128_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
-            self.trtllm_c128_indices[:, SWA_WINDOW:].copy_(self.c128_page_indices)
-            self.trtllm_c128_lens = _tile_padded(
-                SWA_WINDOW,
-                (self.c128_topk_lengths_clamp1 + SWA_WINDOW).to(torch.int32),
-            )
 
 
 @dataclass
@@ -1109,8 +1194,13 @@ class DeepseekV4AttnBackend(
         # The distinct ratios this stage has, sorted -- (4, 128) for V4, (1, 2)
         # for V4.1 -- not the per-layer hf_config.compress_ratios list. Nothing
         # is built for a ratio outside this set.
+        # Empty C4/C128 pools are kept for compatibility even when the model
+        # only uses V4.1 ratios 1/2. They have no metadata consumers.
+        model_ratios = set(self.token_to_kv_pool.compression_ratios)
         self.present_ratios: Tuple[int, ...] = tuple(
-            sorted(self.token_to_kv_pool.kv_pools)
+            ratio
+            for ratio in sorted(self.token_to_kv_pool.kv_pools)
+            if ratio in model_ratios
         )
         self.low_ratios: Tuple[int, ...] = tuple(
             ratio for ratio in (1, 2) if ratio in self.present_ratios
@@ -1805,7 +1895,9 @@ class DeepseekV4AttnBackend(
         )
         extend_seq_lens = self._move_to_device(lengths.extend_seq_lens_cpu)
         return self.init_forward_metadata_prefill(
-            max_seq_len=max_seq_len,
+            # DSpark draft blocks are SWA-only, like draft extend. Their full
+            # context page table is unused; retain only its 2-D placeholder.
+            max_seq_len=self.page_size,
             req_pool_indices=req_pool_indices,
             seq_lens=lengths.seq_lens_extended,
             seq_lens_cpu=lengths.seq_lens_cpu_extended,
@@ -3834,6 +3926,14 @@ class DeepseekV4AttnBackend(
                 else:
                     from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
+                _maybe_precompute_flashmla_sched_meta(
+                    flashmla_metadata,
+                    q=q,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    extra_indices=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )
                 o = flash_mla_with_kvcache(
                     q=q,
                     k_cache=swa_k_cache,
@@ -4233,7 +4333,25 @@ class DeepseekV4AttnBackend(
     ) -> DSV4AttnMetadata:
         assert self.swa_page_size == SWA_WINDOW
 
-        prep = BuildPageTablePositions.execute(
+        small_metadata = (
+            not is_prefill
+            and seq_lens_casual.is_cuda
+            and 0 < seq_lens_casual.numel() <= 8
+            and out_loc.numel() == seq_lens_casual.numel()
+            and self.low_ratios == (1, 2)
+            and set(self.present_ratios) == {1, 2}
+            and get_parallel().attn_cp_size == 1
+            and self.token_to_kv_pool.request_window is None
+        )
+        build_pages = BuildPageTablePositions.execute
+        if small_metadata:
+            from sglang.kernels.ops.attention.dsv41_small_metadata import (
+                low_ratio_metadata,
+                page_table_positions_small,
+            )
+
+            build_pages = page_table_positions_small
+        prep = build_pages(
             req_to_token=req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
             seq_lens_casual=seq_lens_casual,
@@ -4328,8 +4446,15 @@ class DeepseekV4AttnBackend(
         )
 
         if need_compress:
-            core_attn_metadata.init_compression_metadata(num_tokens)
-            core_attn_metadata.init_flashmla_related(is_prefill=is_prefill)
+            low_ratio_buffers = (
+                low_ratio_metadata(seq_lens_casual, out_loc, self.index_topk)
+                if small_metadata
+                else None
+            )
+            core_attn_metadata.init_compression_metadata(num_tokens, low_ratio_buffers)
+            core_attn_metadata.init_flashmla_related(
+                is_prefill=is_prefill, low_ratio_buffers=low_ratio_buffers
+            )
             if self.trtllm_attn:
                 core_attn_metadata.init_trtllm_sparse_buffers()
         else:

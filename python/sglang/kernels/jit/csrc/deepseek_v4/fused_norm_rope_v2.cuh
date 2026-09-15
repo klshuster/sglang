@@ -411,15 +411,15 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   constexpr uint32_t kRopeWarp = kNumWarps - 1;
   // kBf16Store: write the whole head_dim as plain BF16 (no fp8 / no scale) into a
   // [num_slots, head_dim] bf16 cache (page_size==1) at row out_loc
+  static_assert(!(kBf16Store && kLayout != deepseek_v4::KVLayout::V4), "the bf16 store is not a paged layout");
+  using Paged = deepseek_v4::PagedKV<kLayout, kPageBits>;
   // kFp8TwoPool: 512 B row holding the 448 fp8 nope + its UE8M0 scales, with rope
   // split off into a second [num_slots, kRopeDim] bf16 pool at the same row
   static_assert(!(kBf16Store && kFp8TwoPool));
-  static_assert(!(kFp8TwoPool && kLayout != deepseek_v4::KVLayout::V4), "the fp8 two-pool store is a V4-layout cache");
   constexpr int64_t kRowBytes = kBf16Store ? (kHeadDim * 2ll) : (kFp8TwoPool ? kFp8TwoPoolRowBytes : 576ll);
   constexpr int64_t kPageBytes =
       (kBf16Store || kFp8TwoPool) ? (kRowBytes << kPageBits) : host::div_ceil(584ll << kPageBits, 576) * 576;
-  static_assert(!(kBf16Store && kLayout != deepseek_v4::KVLayout::V4), "the bf16 store is not a paged layout");
-  using Paged = deepseek_v4::PagedKV<kLayout, kPageBits>;
+  static_assert(!(kFp8TwoPool && kLayout != deepseek_v4::KVLayout::V4), "the fp8 two-pool store is a V4 cache");
   static_assert(kHeadDim == kBlockSize * kVecSize);
   static_assert(kRopeDim == kWarpThreads * kVecSize);
   static_assert(kHeadDim - kRopeDim == kRopeWarp * kWarpThreads * kVecSize);
@@ -487,9 +487,6 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
     }
   }
 
-  const int64_t page = out_loc >> kPageBits;
-  const int64_t offset = out_loc & ((1 << kPageBits) - 1);
-  const auto page_ptr = params.kvcache + page * kPageBytes;
   const auto row = Paged::row(params.kvcache, out_loc);
 
   if constexpr (kLayout != deepseek_v4::KVLayout::V4) {
@@ -513,11 +510,14 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
     return;
   }
 
-  // The bf16 cache is dense [num_slots, head_dim] bf16 rows, so row out_loc sits at
-  // out_loc * head_dim * 2 whatever the page size.
-  const auto value_ptr =
-      kFp8TwoPool ? page_ptr + offset * kRowBytes
-                  : (kBf16Store ? params.kvcache + static_cast<int64_t>(out_loc) * (kHeadDim * 2) : row.data);
+  // V4 rows come from the paged helper. The bf16 cache is dense [num_slots, head_dim]
+  // rows and the fp8 two-pool cache is kRowBytes rows, both addressed by out_loc.
+  const int64_t page = out_loc >> kPageBits;
+  const int64_t offset = out_loc & ((1 << kPageBits) - 1);
+  const auto page_ptr = params.kvcache + page * kPageBytes;
+  const auto value_ptr = kBf16Store    ? params.kvcache + static_cast<int64_t>(out_loc) * (kHeadDim * 2)
+                         : kFp8TwoPool ? page_ptr + offset * kRowBytes
+                                       : row.data;
 
   PDLTriggerSecondary<kUsePDL>();
 
@@ -568,7 +568,6 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
         scale_ptr[0] = scale_ue8m0;
         scale_ptr[1] = scale_ue8m0;
       } else {
-        // V4 layout: the page's scale block, addressed through the paged row.
         static_cast<uint8_t*>(row.scale)[warp_id] = scale_ue8m0;
       }
     }
@@ -613,7 +612,8 @@ struct FusedNormRopeKernel {
   static constexpr auto select_fp8_2buff_kernel() {
     static_assert(!kIsIndexer, "fp8 two-pool store is only defined for the flashmla latent");
     static_assert(!kBf16Store, "fp8 two-pool store and bf16 store are separate layouts");
-    return fused_norm_rope_flashmla<DType, kMode, kLogPageSize, false, deepseek_v4::KVLayout::V4, kUsePDL, true>;
+    static_assert(kLayout == deepseek_v4::KVLayout::V4, "the fp8 two-pool store is a V4 cache");
+    return fused_norm_rope_flashmla<DType, kMode, kLogPageSize, false, kLayout, kUsePDL, true>;
   }
 
   template <ForwardMode kMode>
